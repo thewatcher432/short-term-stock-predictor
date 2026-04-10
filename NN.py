@@ -1,666 +1,710 @@
-# =============================================================================
-# NN.py — Short-Term Stock Movement Predictor
-# Science Fair 2026
-#
-# Predicts whether a stock price will be HIGHER or LOWER in HORIZON days.
-# Compares: LSTM Neural Network vs Logistic Regression vs Random Guessing
-# =============================================================================
+App.py — Tkinter GUI wrapper for the LSTM stock predictor (imports from NN.py)
 
 import os
+import json
+import threading
+import tkinter as tk
+from tkinter import ttk, messagebox
 import numpy as np
 import pandas as pd
-import yfinance as yf
+from datetime import datetime
 
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-from sklearn.utils import class_weight
-from sklearn.linear_model import LogisticRegression
-
-import tensorflow as tf
-from tensorflow.keras import layers, models, regularizers, callbacks
-
-import ta
-from datetime import datetime, timedelta
-import joblib
+# Matplotlib embedded in Tkinter
 import matplotlib
 matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+# Import all ML backend functions from NN.py
+from NN import (
+    download_data,
+    add_technical_indicators,
+    create_dataset,
+    build_lstm_model,
+    train_with_random_data,
+    predict_next_week,
+    random_guess_evaluation,
+    logistic_regression_evaluation,
+    evaluate_logistic_regression_single,
+    MODEL_DIR,
+    TICKERS,
+    SEQ_LEN,
+    HORIZON,
+    TEST_SIZE,
+    GAP,
+    BATCH_SIZE,
+    EPOCHS,
+    SEED,
+)
 
-SEQ_LEN    = 90      # days of history fed to LSTM (try 70–120)
-HORIZON    = 5       # days ahead to predict (1=next day, 5=1 week)
-TEST_SIZE  = 0.2     # fraction of data for unseen test set
-GAP        = 10      # buffer between train end and test start (prevents leakage)
-BATCH_SIZE = 32
-EPOCHS     = 40
-SEED       = 42
-
-MODEL_DIR = "saved_model"
-os.makedirs(MODEL_DIR, exist_ok=True)
-
-TICKERS = ["AAPL", "MSFT", "AMZN"]
-
-np.random.seed(SEED)
-tf.random.set_seed(SEED)
+import tensorflow as tf
+from tensorflow.keras import models, callbacks, regularizers
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
+from sklearn.utils import class_weight
+import joblib
 
 
-# =============================================================================
-# DATA FUNCTIONS
-# =============================================================================
+# ─────────────────────────────────────────────
+# Dark theme color palette
+# ─────────────────────────────────────────────
+BG       = "#1e1e2e"   # main background
+SURFACE  = "#2a2a3e"   # card / panel background
+ACCENT   = "#7c6af7"   # purple accent
+GREEN    = "#50fa7b"
+RED      = "#ff5555"
+FG       = "#cdd6f4"   # primary text
+MUTED    = "#6c7086"   # secondary text
+BORDER   = "#313244"
 
-def download_data(ticker: str, years: int = 10) -> pd.DataFrame:
+
+class StockPredictorApp(tk.Tk):
+    """Main application window."""
+
+    def __init__(self):
+        super().__init__()
+
+        self.title("LSTM Stock Movement Predictor")
+        self.geometry("1200x820")
+        self.configure(bg=BG)
+        self.resizable(True, True)
+
+        # Track the currently selected ticker
+        self.selected_ticker = tk.StringVar(value="AAPL")
+
+        # History object returned by Keras training (used for chart)
+        self.train_history = None
+        self.trained_ticker = None
+
+        self._apply_ttk_theme()
+        self._build_ui()
+
+    # ── TTK THEME ────────────────────────────────────────────────────────────
+
+    def _apply_ttk_theme(self):
+        """Apply a clean dark ttk style across all widgets."""
+        style = ttk.Style(self)
+        style.theme_use("clam")
+
+        # Global settings
+        style.configure(".",
+            background=BG,
+            foreground=FG,
+            fieldbackground=SURFACE,
+            troughcolor=SURFACE,
+            bordercolor=BORDER,
+            darkcolor=BORDER,
+            lightcolor=BORDER,
+            font=("Segoe UI", 10),
+        )
+
+        # Frames
+        style.configure("TFrame", background=BG)
+        style.configure("Card.TFrame", background=SURFACE, relief="flat")
+
+        # Labels
+        style.configure("TLabel", background=BG, foreground=FG)
+        style.configure("Card.TLabel", background=SURFACE, foreground=FG)
+        style.configure("Muted.TLabel", background=SURFACE, foreground=MUTED, font=("Segoe UI", 9))
+        style.configure("Title.TLabel", background=BG, foreground=FG,
+                        font=("Segoe UI", 14, "bold"))
+        style.configure("SectionTitle.TLabel", background=SURFACE, foreground=FG,
+                        font=("Segoe UI", 11, "bold"))
+
+        # Buttons
+        style.configure("Accent.TButton",
+            background=ACCENT, foreground="#ffffff",
+            font=("Segoe UI", 10, "bold"),
+            padding=(12, 6),
+            relief="flat",
+        )
+        style.map("Accent.TButton",
+            background=[("active", "#6a5be0"), ("disabled", MUTED)],
+            foreground=[("disabled", "#888888")],
+        )
+
+        style.configure("TButton",
+            background=SURFACE, foreground=FG,
+            font=("Segoe UI", 10),
+            padding=(10, 5),
+            relief="flat",
+        )
+        style.map("TButton",
+            background=[("active", BORDER)],
+        )
+
+        # Entry
+        style.configure("TEntry",
+            fieldbackground=SURFACE,
+            foreground=FG,
+            insertcolor=FG,
+            bordercolor=BORDER,
+            padding=6,
+        )
+
+        # Combobox
+        style.configure("TCombobox",
+            fieldbackground=SURFACE,
+            background=SURFACE,
+            foreground=FG,
+            arrowcolor=FG,
+        )
+        style.map("TCombobox",
+            fieldbackground=[("readonly", SURFACE)],
+            foreground=[("readonly", FG)],
+        )
+
+        # Treeview (results table)
+        style.configure("Treeview",
+            background=SURFACE,
+            fieldbackground=SURFACE,
+            foreground=FG,
+            rowheight=26,
+            font=("Segoe UI", 9),
+        )
+        style.configure("Treeview.Heading",
+            background=BORDER,
+            foreground=FG,
+            font=("Segoe UI", 9, "bold"),
+        )
+        style.map("Treeview",
+            background=[("selected", ACCENT)],
+            foreground=[("selected", "#ffffff")],
+        )
+
+        # Scrollbar
+        style.configure("Vertical.TScrollbar",
+            background=SURFACE, troughcolor=BG, arrowcolor=MUTED)
+
+        # Separator
+        style.configure("TSeparator", background=BORDER)
+
+        # Progress bar
+        style.configure("Accent.Horizontal.TProgressbar",
+            troughcolor=SURFACE, background=ACCENT)
+
+    # ── UI LAYOUT ────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        """Construct all GUI sections."""
+
+        # ── Top bar ──────────────────────────────────────────────────────────
+        top_bar = ttk.Frame(self, style="TFrame")
+        top_bar.pack(fill="x", padx=20, pady=(16, 8))
+
+        ttk.Label(top_bar, text="📈 LSTM Stock Predictor", style="Title.TLabel").pack(side="left")
+
+        # Status label (right-aligned)
+        self.status_var = tk.StringVar(value="Ready")
+        ttk.Label(top_bar, textvariable=self.status_var,
+                  style="Muted.TLabel", background=BG).pack(side="right", padx=8)
+
+        ttk.Separator(self, orient="horizontal").pack(fill="x", padx=20, pady=4)
+
+        # ── Main content: left controls + right chart ─────────────────────
+        content = ttk.Frame(self, style="TFrame")
+        content.pack(fill="both", expand=True, padx=20, pady=8)
+
+        left = ttk.Frame(content, style="TFrame", width=380)
+        left.pack(side="left", fill="y", padx=(0, 12))
+        left.pack_propagate(False)
+
+        right = ttk.Frame(content, style="TFrame")
+        right.pack(side="left", fill="both", expand=True)
+
+        self._build_left_panel(left)
+        self._build_right_panel(right)
+
+    # ── LEFT PANEL ───────────────────────────────────────────────────────────
+
+    def _build_left_panel(self, parent):
+        """Search bar, action buttons, prediction result, eval table."""
+
+        # ── Ticker search card ───────────────────────────────────────────
+        search_card = ttk.Frame(parent, style="Card.TFrame", padding=14)
+        search_card.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(search_card, text="Ticker / Symbol", style="SectionTitle.TLabel").pack(anchor="w")
+        ttk.Label(search_card,
+                  text="Search any US stock, ETF, or mutual fund",
+                  style="Muted.TLabel").pack(anchor="w", pady=(2, 8))
+
+        entry_row = ttk.Frame(search_card, style="Card.TFrame")
+        entry_row.pack(fill="x")
+
+        # Text entry for manual ticker input
+        self.ticker_entry = ttk.Entry(entry_row, textvariable=self.selected_ticker,
+                                      font=("Segoe UI", 11))
+        self.ticker_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.ticker_entry.bind("<Return>", lambda _: self._on_ticker_change())
+
+        ttk.Button(entry_row, text="Set", style="TButton",
+                   command=self._on_ticker_change).pack(side="left")
+
+        # Quick-pick known tickers
+        quick_row = ttk.Frame(search_card, style="Card.TFrame")
+        quick_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(quick_row, text="Quick picks:", style="Muted.TLabel").pack(side="left", padx=(0, 6))
+        for t in ["AAPL", "MSFT", "AMZN", "SPY", "QQQ"]:
+            ttk.Button(quick_row, text=t, style="TButton",
+                       command=lambda tick=t: self._set_ticker(tick)).pack(side="left", padx=2)
+
+        # Current ticker display
+        self.ticker_display = tk.StringVar(value=f"Active: {self.selected_ticker.get()}")
+        ttk.Label(search_card, textvariable=self.ticker_display,
+                  style="Muted.TLabel").pack(anchor="w", pady=(6, 0))
+
+        # ── Action buttons card ───────────────────────────────────────────
+        btn_card = ttk.Frame(parent, style="Card.TFrame", padding=14)
+        btn_card.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(btn_card, text="Actions", style="SectionTitle.TLabel").pack(anchor="w", pady=(0, 8))
+
+        # Train Model button
+        self.train_btn = ttk.Button(btn_card, text="🧠  Train Model",
+                                    style="Accent.TButton", command=self._start_training)
+        self.train_btn.pack(fill="x", pady=(0, 6))
+
+        # Progress bar shown during training
+        self.progress = ttk.Progressbar(btn_card, mode="indeterminate",
+                                        style="Accent.Horizontal.TProgressbar")
+        self.progress.pack(fill="x", pady=(0, 4))
+
+        # Status label below progress bar
+        self.train_status = tk.StringVar(value="")
+        ttk.Label(btn_card, textvariable=self.train_status,
+                  style="Muted.TLabel").pack(anchor="w", pady=(0, 8))
+
+        ttk.Separator(btn_card, orient="horizontal").pack(fill="x", pady=6)
+
+        # Predict button
+        self.predict_btn = ttk.Button(btn_card, text="🔮  Predict Next Week",
+                                      style="TButton", command=self._start_prediction)
+        self.predict_btn.pack(fill="x", pady=(0, 6))
+
+        # Evaluate button
+        self.eval_btn = ttk.Button(btn_card, text="📊  Evaluate Model",
+                                   style="TButton", command=self._start_evaluation)
+        self.eval_btn.pack(fill="x")
+
+        # ── Prediction result card ────────────────────────────────────────
+        pred_card = ttk.Frame(parent, style="Card.TFrame", padding=14)
+        pred_card.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(pred_card, text="Prediction Result", style="SectionTitle.TLabel").pack(anchor="w", pady=(0, 8))
+
+        result_row = ttk.Frame(pred_card, style="Card.TFrame")
+        result_row.pack(fill="x")
+
+        # Direction indicator (UP / DOWN / —)
+        self.direction_var = tk.StringVar(value="—")
+        self.direction_label = tk.Label(result_row, textvariable=self.direction_var,
+                                        font=("Segoe UI", 28, "bold"),
+                                        bg=SURFACE, fg=MUTED)
+        self.direction_label.pack(side="left", padx=(0, 14))
+
+        detail_col = ttk.Frame(result_row, style="Card.TFrame")
+        detail_col.pack(side="left", fill="x", expand=True)
+
+        self.prob_var = tk.StringVar(value="Probability: —")
+        ttk.Label(detail_col, textvariable=self.prob_var,
+                  style="Card.TLabel", font=("Segoe UI", 10)).pack(anchor="w")
+
+        self.pred_ticker_var = tk.StringVar(value="Ticker: —")
+        ttk.Label(detail_col, textvariable=self.pred_ticker_var,
+                  style="Muted.TLabel").pack(anchor="w")
+
+        self.pred_date_var = tk.StringVar(value="")
+        ttk.Label(detail_col, textvariable=self.pred_date_var,
+                  style="Muted.TLabel").pack(anchor="w")
+
+        # ── Evaluation results table ──────────────────────────────────────
+        eval_card = ttk.Frame(parent, style="Card.TFrame", padding=14)
+        eval_card.pack(fill="both", expand=True)
+
+        ttk.Label(eval_card, text="Evaluation Results", style="SectionTitle.TLabel").pack(anchor="w", pady=(0, 8))
+
+        cols = ("Model", "Accuracy")
+        self.eval_tree = ttk.Treeview(eval_card, columns=cols, show="headings", height=6)
+        for col in cols:
+            self.eval_tree.heading(col, text=col)
+            self.eval_tree.column(col, width=140, anchor="center")
+        self.eval_tree.pack(fill="both", expand=True)
+
+        # ── Last JSON report card ─────────────────────────────────────────
+        report_card = ttk.Frame(parent, style="Card.TFrame", padding=14)
+        report_card.pack(fill="x", pady=(10, 0))
+
+        ttk.Label(report_card, text="Last Saved Report", style="SectionTitle.TLabel").pack(anchor="w", pady=(0, 6))
+
+        self.report_var = tk.StringVar(value="No report loaded.")
+        ttk.Label(report_card, textvariable=self.report_var,
+                  style="Muted.TLabel", wraplength=340, justify="left").pack(anchor="w")
+
+    # ── RIGHT PANEL (chart) ───────────────────────────────────────────────────
+
+    def _build_right_panel(self, parent):
+        """Embedded matplotlib chart for training loss & accuracy."""
+        chart_card = ttk.Frame(parent, style="Card.TFrame", padding=14)
+        chart_card.pack(fill="both", expand=True)
+
+        ttk.Label(chart_card, text="Training Curves", style="SectionTitle.TLabel").pack(anchor="w", pady=(0, 8))
+
+        # Create figure with dark style
+        self.fig = Figure(figsize=(7, 5), facecolor=SURFACE)
+        self.ax_loss = self.fig.add_subplot(211)
+        self.ax_acc  = self.fig.add_subplot(212)
+        self._style_axes(self.ax_loss, "Loss")
+        self._style_axes(self.ax_acc,  "Accuracy")
+        self.fig.tight_layout(pad=2.5)
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=chart_card)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.canvas.draw()
+
+    def _style_axes(self, ax, ylabel):
+        """Apply dark theme styling to a matplotlib axes."""
+        ax.set_facecolor(SURFACE)
+        ax.tick_params(colors=MUTED, labelsize=8)
+        ax.set_ylabel(ylabel, color=MUTED, fontsize=9)
+        ax.set_xlabel("Epoch", color=MUTED, fontsize=9)
+        for spine in ax.spines.values():
+            spine.set_edgecolor(BORDER)
+        ax.title.set_color(FG)
+
+    # ── TICKER HELPERS ────────────────────────────────────────────────────────
+
+    def _set_ticker(self, ticker):
+        """Set ticker from a quick-pick button."""
+        self.selected_ticker.set(ticker)
+        self._on_ticker_change()
+
+    def _on_ticker_change(self):
+        """Update the active ticker display and load any saved report."""
+        t = self.selected_ticker.get().strip().upper()
+        self.selected_ticker.set(t)
+        self.ticker_display.set(f"Active: {t}")
+        self._load_report(t)
+
+    # ── TRAINING ─────────────────────────────────────────────────────────────
+
+    def _start_training(self):
+        """Launch model training in a background thread."""
+        self.train_btn.config(state="disabled")
+        self.predict_btn.config(state="disabled")
+        self.eval_btn.config(state="disabled")
+        self.train_status.set("⏳ Downloading data & training…")
+        self.status_var.set("Training…")
+        self.progress.start(12)   # animate indeterminate bar
+
+        # Run training off the main thread so UI stays responsive
+        t = threading.Thread(target=self._train_thread, daemon=True)
+        t.start()
+
+    def _train_thread(self):
+        """Background: calls the NN training pipeline, then updates UI."""
+        try:
+            # We patch train_with_random_data to also capture history.
+            # Since we need the history object for charts, we run the
+            # training inline here and mirror the NN.py logic.
+            ticker, model_path, scaler_path, history = _train_and_capture_history(
+                self.selected_ticker.get().strip().upper()
+            )
+            self.trained_ticker = ticker
+            self.train_history   = history
+
+            # Marshal UI updates back to the main thread
+            self.after(0, self._on_training_done, ticker, model_path, scaler_path)
+        except Exception as exc:
+            self.after(0, self._on_training_error, str(exc))
+
+    def _on_training_done(self, ticker, model_path, scaler_path):
+        """Called on the main thread after training succeeds."""
+        self.progress.stop()
+        self.train_status.set(f"✅ Trained on {ticker} — model saved.")
+        self.status_var.set("Idle")
+        self._re_enable_buttons()
+        self._plot_history(self.train_history)
+        self._load_report(ticker)
+
+    def _on_training_error(self, msg):
+        """Called on the main thread if training raises an exception."""
+        self.progress.stop()
+        self.train_status.set("❌ Training failed.")
+        self.status_var.set("Error")
+        self._re_enable_buttons()
+        messagebox.showerror("Training Error", msg)
+
+    # ── PREDICTION ───────────────────────────────────────────────────────────
+
+    def _start_prediction(self):
+        """Launch prediction in a background thread."""
+        ticker = self.selected_ticker.get().strip().upper()
+        model_path  = f"{MODEL_DIR}/{ticker}_best.h5"
+        scaler_path = f"{MODEL_DIR}/{ticker}_scaler.joblib"
+
+        # Guard: check files exist before starting thread
+        if not os.path.exists(model_path) or not os.path.exists(scaler_path):
+            messagebox.showerror(
+                "Model Not Found",
+                f"No saved model found for {ticker}.\nPlease train the model first."
+            )
+            return
+
+        self._disable_buttons()
+        self.status_var.set("Predicting…")
+
+        t = threading.Thread(
+            target=self._predict_thread,
+            args=(ticker, model_path, scaler_path),
+            daemon=True,
+        )
+        t.start()
+
+    def _predict_thread(self, ticker, model_path, scaler_path):
+        """Background: runs predict_next_week from NN.py."""
+        try:
+            result = predict_next_week(ticker, model_path, scaler_path)
+            self.after(0, self._on_prediction_done, ticker, result)
+        except Exception as exc:
+            self.after(0, self._on_prediction_error, str(exc))
+
+    def _on_prediction_done(self, ticker, result):
+        prob_up   = result["prob_up"]
+        going_up  = result["direction_up"]
+
+        # Color-coded direction label
+        direction_text  = "▲ UP"  if going_up else "▼ DOWN"
+        direction_color = GREEN   if going_up else RED
+
+        self.direction_var.set(direction_text)
+        self.direction_label.config(fg=direction_color)
+        self.prob_var.set(f"Probability UP: {prob_up:.1%}")
+        self.pred_ticker_var.set(f"Ticker: {ticker}")
+        self.pred_date_var.set(f"As of: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+        self.status_var.set("Idle")
+        self._re_enable_buttons()
+
+    def _on_prediction_error(self, msg):
+        self.status_var.set("Error")
+        self._re_enable_buttons()
+        messagebox.showerror("Prediction Error", msg)
+
+    # ── EVALUATION ───────────────────────────────────────────────────────────
+
+    def _start_evaluation(self):
+        """Launch all 3 evaluation comparisons in a background thread."""
+        ticker = self.selected_ticker.get().strip().upper()
+        model_path  = f"{MODEL_DIR}/{ticker}_best.h5"
+        scaler_path = f"{MODEL_DIR}/{ticker}_scaler.joblib"
+
+        if not os.path.exists(model_path) or not os.path.exists(scaler_path):
+            messagebox.showerror(
+                "Model Not Found",
+                f"No saved model found for {ticker}.\nPlease train the model first."
+            )
+            return
+
+        self._disable_buttons()
+        self.status_var.set("Evaluating…")
+
+        # Clear previous table rows
+        for row in self.eval_tree.get_children():
+            self.eval_tree.delete(row)
+
+        t = threading.Thread(
+            target=self._eval_thread,
+            args=(ticker, model_path, scaler_path),
+            daemon=True,
+        )
+        t.start()
+
+    def _eval_thread(self, ticker, model_path, scaler_path):
+        """Background: runs all 3 evaluation functions from NN.py."""
+        try:
+            # Comparison: LSTM vs logistic regression vs random
+            lr_results = logistic_regression_evaluation(ticker, model_path, scaler_path)
+
+            # Single prediction check (logistic)
+            evaluate_logistic_regression_single(ticker, model_path, scaler_path)
+
+            # Random guess comparison
+            rg_results = random_guess_evaluation(ticker, model_path, scaler_path)
+
+            self.after(0, self._on_eval_done, lr_results, rg_results)
+        except Exception as exc:
+            self.after(0, self._on_eval_error, str(exc))
+
+    def _on_eval_done(self, lr_results, rg_results):
+        """Populate the evaluation table with accuracy figures."""
+        rows = [
+            ("LSTM Model",          lr_results.get("lstm_accuracy")),
+            ("Logistic Regression", lr_results.get("logistic_regression_accuracy")),
+            ("Random Guess",        lr_results.get("random_accuracy")),
+        ]
+
+        for model_name, acc in rows:
+            display = f"{acc:.1%}" if isinstance(acc, float) else "N/A"
+            self.eval_tree.insert("", "end", values=(model_name, display))
+
+        self.status_var.set("Idle")
+        self._re_enable_buttons()
+
+    def _on_eval_error(self, msg):
+        self.status_var.set("Error")
+        self._re_enable_buttons()
+        messagebox.showerror("Evaluation Error", msg)
+
+    # ── CHART ────────────────────────────────────────────────────────────────
+
+    def _plot_history(self, history):
+        """Render loss & accuracy curves from the Keras History object."""
+        if history is None:
+            return
+
+        h = history.history
+
+        # Clear previous plots
+        self.ax_loss.cla()
+        self.ax_acc.cla()
+
+        # Loss curves
+        self.ax_loss.plot(h["loss"],     label="Train Loss", color=ACCENT, linewidth=1.5)
+        self.ax_loss.plot(h["val_loss"], label="Val Loss",   color=RED,    linewidth=1.5, linestyle="--")
+        self.ax_loss.legend(fontsize=8, facecolor=SURFACE, labelcolor=FG, edgecolor=BORDER)
+        self._style_axes(self.ax_loss, "Loss")
+
+        # Accuracy curves
+        self.ax_acc.plot(h["accuracy"],     label="Train Acc", color=GREEN,  linewidth=1.5)
+        self.ax_acc.plot(h["val_accuracy"], label="Val Acc",   color=ACCENT, linewidth=1.5, linestyle="--")
+        self.ax_acc.legend(fontsize=8, facecolor=SURFACE, labelcolor=FG, edgecolor=BORDER)
+        self._style_axes(self.ax_acc, "Accuracy")
+
+        self.fig.tight_layout(pad=2.5)
+        self.canvas.draw()   # Refresh the embedded canvas
+
+    # ── REPORT ───────────────────────────────────────────────────────────────
+
+    def _load_report(self, ticker):
+        """Load and display the last saved JSON report for a ticker."""
+        report_path = f"{MODEL_DIR}/{ticker}_report.json"
+        if not os.path.exists(report_path):
+            self.report_var.set(f"No report for {ticker}.")
+            return
+        try:
+            with open(report_path) as f:
+                data = json.load(f)
+            # Format as a compact multi-line string
+            lines = [
+                f"Ticker:   {data.get('ticker', ticker)}",
+                f"Accuracy: {float(data.get('accuracy', 0)):.2%}",
+                f"Horizon:  {data.get('horizon', HORIZON)} days",
+                f"Date:     {data.get('date', '—')[:19]}",
+            ]
+            self.report_var.set("\n".join(lines))
+        except Exception as e:
+            self.report_var.set(f"Could not read report: {e}")
+
+    # ── BUTTON HELPERS ────────────────────────────────────────────────────────
+
+    def _disable_buttons(self):
+        self.train_btn.config(state="disabled")
+        self.predict_btn.config(state="disabled")
+        self.eval_btn.config(state="disabled")
+
+    def _re_enable_buttons(self):
+        self.train_btn.config(state="normal")
+        self.predict_btn.config(state="normal")
+        self.eval_btn.config(state="normal")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Inline training helper (mirrors NN.train_with_random_data but also returns
+# the Keras History so the GUI can plot loss/accuracy curves).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _train_and_capture_history(ticker):
     """
-    Download daily OHLCV data from Yahoo Finance.
-    Renames 'Close' to 'Adj Close' for consistency.
-    Handles MultiIndex columns from newer yfinance versions.
+    Full training pipeline for a given ticker.
+    Returns (ticker, model_path, scaler_path, history).
+    The history object is used by the GUI to draw training curves.
     """
-    end   = datetime.now()
-    start = end - timedelta(days=365 * years)
+    import numpy as np
+    from sklearn.utils import class_weight as cw_module
 
-    df = yf.download(ticker, start=start, end=end, progress=False)
-    df = df.dropna()
-
-    # Flatten MultiIndex if present (newer yfinance)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
-
-    df = df.rename(columns={"Close": "Adj Close"})
-    return df
-
-
-def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Adds the following features to the dataframe:
-      - return_1       : 1-day percentage return
-      - return_5       : 5-day percentage return
-      - SMA_10         : 10-day simple moving average
-      - SMA_21         : 21-day simple moving average
-      - EMA_20         : 20-day exponential moving average
-      - RSI_14         : 14-day Relative Strength Index
-      - BB_width       : Bollinger Band width normalized by price
-      - vol_pct_change : 1-day volume percentage change
-      - Volume         : log(1 + volume) to reduce skew
-    """
-    data = df.copy()
-
-    # Price returns
-    data["return_1"] = data["Adj Close"].pct_change(1)
-    data["return_5"] = data["Adj Close"].pct_change(5)
-
-    # Moving averages
-    data["SMA_10"] = data["Adj Close"].rolling(10).mean()
-    data["SMA_21"] = data["Adj Close"].rolling(21).mean()
-    data["EMA_20"] = data["Adj Close"].ewm(span=20).mean()
-
-    # Momentum
-    data["RSI_14"] = ta.momentum.rsi(data["Adj Close"], window=14)
-
-    # Volatility
-    bb = ta.volatility.BollingerBands(data["Adj Close"])
-    data["BB_width"] = (
-        bb.bollinger_hband() - bb.bollinger_lband()
-    ) / data["Adj Close"]
-
-    # Volume
-    data["vol_pct_change"] = data["Volume"].pct_change(1)
-    data["Volume"]         = np.log1p(data["Volume"])
-
-    return data.dropna()
-
-
-# =============================================================================
-# LABEL CREATION  (single source of truth)
-# =============================================================================
-
-def create_labels(df: pd.DataFrame, horizon: int) -> pd.Series:
-    """
-    Binary target:
-      1 = Adj Close at (t + horizon) > Adj Close at t  (price went UP)
-      0 = price went DOWN or stayed same
-    """
-    return (
-        df["Adj Close"].shift(-horizon) > df["Adj Close"]
-    ).astype(int)
-
-
-# =============================================================================
-# DATASET BUILDER
-# =============================================================================
-
-def create_dataset(
-    df: pd.DataFrame,
-    features: list,
-    horizon: int,
-    seq_len: int
-):
-    """
-    Builds sliding-window sequences.
-
-    X shape: (num_samples, seq_len, num_features)
-    y shape: (num_samples,)
-
-    Each sample X[i] is the feature matrix for the window
-    [i - seq_len : i], and y[i] is the direction label
-    for day (i + horizon).
-    """
-    X, y = [], []
-    labels = create_labels(df, horizon)
-
-    for i in range(seq_len, len(df) - horizon):
-        X.append(df[features].iloc[i - seq_len:i].values)
-        y.append(labels.iloc[i])
-
-    return np.array(X), np.array(y)
-
-
-# =============================================================================
-# MODEL ARCHITECTURE
-# =============================================================================
-
-def build_lstm_model(input_shape: tuple) -> tf.keras.Model:
-    """
-    LSTM binary classifier.
-
-    Architecture:
-        Input  (seq_len, num_features)
-        LSTM   32 units, L2 regularization
-        BatchNorm
-        Dropout 0.3
-        Dense  16, ReLU
-        Dropout 0.3
-        Dense  1,  Sigmoid  ->  P(UP)
-
-    Compiled with Adam (lr=1e-4) and binary crossentropy loss.
-    """
-    model = models.Sequential([
-        layers.Input(shape=input_shape),
-        layers.LSTM(32, kernel_regularizer=regularizers.l2(1e-3)),
-        layers.BatchNormalization(),
-        layers.Dropout(0.3),
-        layers.Dense(16, activation="relu"),
-        layers.Dropout(0.3),
-        layers.Dense(1, activation="sigmoid")
-    ])
-
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(1e-4),
-        loss="binary_crossentropy",
-        metrics=["accuracy"]
-    )
-    return model
-
-
-# =============================================================================
-# TRAINING PIPELINE
-# =============================================================================
-
-def train_with_random_data():
-    """
-    Randomly selects a ticker and a training period (5–20 years),
-    trains the full pipeline, and saves model + scaler + report.
-
-    Returns: (ticker, model_path, scaler_path)
-    """
-    ticker = np.random.choice(TICKERS)
-    years  = np.random.randint(5, 20)
-    return train_models(ticker, years)
-
-
-def train_models(ticker: str, years: int = 10):
-    """
-    Full training pipeline for one ticker.
-
-    Steps:
-      1. Download + add indicators
-      2. Build sequences (X, y)
-      3. Chronological train/test split with GAP
-      4. Fit scaler on train, apply to both splits
-      5. Train LSTM with early stopping + class weights
-      6. Train Logistic Regression on same scaled data
-      7. Evaluate all three models on unseen test set
-      8. Save model, scaler, JSON report
-
-    Returns: (ticker, model_path, scaler_path)
-    """
-    print(f"\nTraining on {ticker} using {years} years of data")
-
-    # -- Data --
-    raw = download_data(ticker, years)
-    df  = add_technical_indicators(raw)
+    years = np.random.randint(5, 20)
 
     feature_cols = [
         "return_1", "return_5",
-        "SMA_10",   "SMA_21",
-        "EMA_20",   "RSI_14",
-        "BB_width", "vol_pct_change", "Volume"
+        "SMA_10", "SMA_21",
+        "EMA_20", "RSI_14",
+        "BB_width", "vol_pct_change", "Volume",
     ]
 
-    X, y = create_dataset(df, feature_cols, HORIZON, SEQ_LEN)
+    # Download & preprocess
+    raw = download_data(ticker, years)
+    df  = add_technical_indicators(raw)
+    X, y = create_dataset(df, feature_cols)
 
-    # -- Chronological split with GAP --
-    split     = int(len(X) * (1 - TEST_SIZE))
-    train_end = max(split - GAP, 0)
+    # Train / test split with gap to avoid leakage
+    split = int(len(X) * (1 - TEST_SIZE))
+    X_train, y_train = X[:split - GAP], y[:split - GAP]
+    X_test,  y_test  = X[split:],       y[split:]
 
-    X_train, y_train = X[:train_end], y[:train_end]
-    X_test,  y_test  = X[split:],     y[split:]
+    # Fit scaler on training data only
+    scaler = StandardScaler()
+    scaler.fit(X_train.reshape(-1, X_train.shape[-1]))
+    X_train = scaler.transform(X_train.reshape(-1, X_train.shape[-1])).reshape(X_train.shape)
+    X_test  = scaler.transform(X_test.reshape(-1,  X_test.shape[-1])).reshape(X_test.shape)
 
-    print(f"Train samples : {len(X_train)}")
-    print(f"Test  samples : {len(X_test)}")
-
-    # -- Scaling (fit on train only) --
-    scaler      = StandardScaler()
-    X_train_2d  = X_train.reshape(-1, X_train.shape[-1])
-    scaler.fit(X_train_2d)
-
-    X_train_scaled = (
-        scaler.transform(X_train_2d).reshape(X_train.shape)
-    )
-    X_test_scaled = (
-        scaler.transform(
-            X_test.reshape(-1, X_test.shape[-1])
-        ).reshape(X_test.shape)
-    )
-
-    scaler_path = os.path.join(MODEL_DIR, f"{ticker}_scaler.joblib")
-    model_path  = os.path.join(MODEL_DIR, f"{ticker}_best.h5")
+    # Persist scaler
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    scaler_path = f"{MODEL_DIR}/{ticker}_scaler.joblib"
+    model_path  = f"{MODEL_DIR}/{ticker}_best.h5"
     joblib.dump(scaler, scaler_path)
 
-    # -- Class weights to handle imbalance --
-    cw = class_weight.compute_class_weight(
-        class_weight="balanced",
-        classes=np.unique(y_train),
-        y=y_train
-    )
+    # Class weights to handle imbalanced labels
+    cw = cw_module.compute_class_weight("balanced", classes=np.unique(y_train), y=y_train)
     class_weights = dict(enumerate(cw))
 
-    # -- Build + train LSTM --
+    # Build and train LSTM
     model = build_lstm_model((SEQ_LEN, X.shape[-1]))
-
-    es = callbacks.EarlyStopping(
-        patience=5,
-        restore_best_weights=True,
-        monitor="val_loss"
-    )
-
     history = model.fit(
-        X_train_scaled, y_train,
+        X_train, y_train,
         validation_split=0.2,
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
         class_weight=class_weights,
-        callbacks=[es],
-        verbose=1
+        callbacks=[
+            tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True)
+        ],
+        verbose=0,   # suppress console spam in GUI mode
     )
 
     model.save(model_path)
 
-    # -- LSTM evaluation --
-    lstm_preds = (
-        model.predict(X_test_scaled) > 0.5
-    ).astype(int).flatten()
-    lstm_acc = accuracy_score(y_test, lstm_preds)
+    # Evaluate on held-out test set
+    preds = (model.predict(X_test) > 0.5).astype(int)
+    acc   = accuracy_score(y_test, preds)
 
-    print("\n" + "="*40)
-    print("LSTM TEST RESULTS")
-    print("="*40)
-    print("Accuracy :", lstm_acc)
-    print(classification_report(y_test, lstm_preds))
-    print(confusion_matrix(y_test, lstm_preds))
-
-    # -- Logistic Regression (same scaler, same split) --
-    X_train_flat = X_train_scaled.reshape(len(X_train_scaled), -1)
-    X_test_flat  = X_test_scaled.reshape(len(X_test_scaled),  -1)
-
-    log_reg = LogisticRegression(random_state=SEED, max_iter=1000)
-    log_reg.fit(X_train_flat, y_train)
-
-    log_preds = log_reg.predict(X_test_flat)
-    log_acc   = accuracy_score(y_test, log_preds)
-
-    print("\n" + "="*40)
-    print("LOGISTIC REGRESSION RESULTS")
-    print("="*40)
-    print("Accuracy :", log_acc)
-    print(classification_report(y_test, log_preds))
-    print(confusion_matrix(y_test, log_preds))
-
-    # -- Random guessing baseline --
-    rand_preds = np.random.choice([0, 1], size=len(y_test))
-    rand_acc   = accuracy_score(y_test, rand_preds)
-
-    print("\n" + "="*40)
-    print("RANDOM GUESSING BASELINE")
-    print("="*40)
-    print("Accuracy :", rand_acc)
-
-    # -- Training curves --
-    _plot_training_history(history, ticker)
-
-    # -- Save report --
+    # Save JSON report
     report = {
-        "ticker"               : ticker,
-        "years"                : years,
-        "horizon"              : HORIZON,
-        "seq_len"              : SEQ_LEN,
-        "lstm_accuracy"        : float(lstm_acc),
-        "logistic_accuracy"    : float(log_acc),
-        "random_accuracy"      : float(rand_acc),
-        "train_samples"        : int(len(X_train)),
-        "test_samples"         : int(len(X_test)),
-        "date"                 : datetime.now().isoformat()
+        "ticker":   ticker,
+        "years":    int(years),
+        "accuracy": float(acc),
+        "horizon":  HORIZON,
+        "date":     datetime.now().isoformat(),
     }
+    pd.Series(report).to_json(f"{MODEL_DIR}/{ticker}_report.json")
 
-    report_path = os.path.join(MODEL_DIR, f"{ticker}_report.json")
-    pd.Series(report).to_json(report_path)
-    print(f"\nReport saved to {report_path}")
-
-    return ticker, model_path, scaler_path
+    return ticker, model_path, scaler_path, history
 
 
-# =============================================================================
-# PLOTTING
-# =============================================================================
-
-def _plot_training_history(history, ticker: str):
-    """Plot and show training/validation loss and accuracy curves."""
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-
-    axes[0].plot(history.history["loss"],     label="Train Loss")
-    axes[0].plot(history.history["val_loss"], label="Val Loss")
-    axes[0].set_title(f"{ticker} — Loss")
-    axes[0].legend()
-
-    axes[1].plot(history.history["accuracy"],     label="Train Acc")
-    axes[1].plot(history.history["val_accuracy"], label="Val Acc")
-    axes[1].set_title(f"{ticker} — Accuracy")
-    axes[1].legend()
-
-    plt.tight_layout()
-    plt.show()
-
-
-# =============================================================================
-# PREDICTION FUNCTIONS
-# =============================================================================
-
-def predict_next_week(
-    ticker: str,
-    model_path: str,
-    scaler_path: str
-) -> dict:
-    """
-    Loads the saved model and scaler, downloads the most recent
-    data, and returns the probability that the stock will be UP
-    in HORIZON trading days.
-    """
-    model  = models.load_model(model_path)
-    scaler = joblib.load(scaler_path)
-
-    raw = download_data(ticker, years=2)
-    df  = add_technical_indicators(raw)
-
-    feature_cols = [
-        "return_1", "return_5",
-        "SMA_10",   "SMA_21",
-        "EMA_20",   "RSI_14",
-        "BB_width", "vol_pct_change", "Volume"
-    ]
-
-    # Use the most recent SEQ_LEN rows
-    df_recent = df.iloc[-SEQ_LEN:]
-    X = df_recent[feature_cols].values
-
-    X_scaled = scaler.transform(X).reshape(1, SEQ_LEN, len(feature_cols))
-
-    prob_up      = float(model.predict(X_scaled)[0][0])
-    direction_up = prob_up >= 0.5
-
-    return {
-        "ticker"       : ticker,
-        "prob_up"      : round(prob_up, 4),
-        "direction_up" : direction_up,
-        "horizon_days" : HORIZON
-    }
-
-
-def check_prediction(
-    ticker: str,
-    model_path: str,
-    scaler_path: str
-):
-    """
-    Makes a prediction AND checks it against the actual price
-    movement that already happened (using the last known close).
-    Useful for back-checking predictions on recent dates.
-    """
-    result = predict_next_week(ticker, model_path, scaler_path)
-    print("\nPrediction:", result)
-
-    raw = download_data(ticker, years=2)
-    df  = add_technical_indicators(raw)
-
-    actual = df["Adj Close"].iloc[-1] > df["Adj Close"].iloc[-(HORIZON + 1)]
-    print("Actual:", "UP" if actual else "DOWN")
-    print(
-        "Result:",
-        "CORRECT" if result["direction_up"] == actual else "WRONG"
-    )
-
-
-# =============================================================================
-# RANDOM GUESS EVALUATION
-# =============================================================================
-
-def random_guess_evaluation(
-    ticker: str,
-    model_path: str,
-    scaler_path: str
-) -> dict:
-    """
-    Compare model prediction vs a random coin flip on the latest data point.
-    """
-    print("\nEvaluating random guess vs model prediction")
-
-    model  = models.load_model(model_path)
-    scaler = joblib.load(scaler_path)
-
-    raw = download_data(ticker, years=2)
-    df  = add_technical_indicators(raw)
-
-    feature_cols = [
-        "return_1", "return_5",
-        "SMA_10",   "SMA_21",
-        "EMA_20",   "RSI_14",
-        "BB_width", "vol_pct_change", "Volume"
-    ]
-
-    df_recent = df.iloc[-SEQ_LEN:]
-    X = df_recent[feature_cols].values
-    X_scaled = scaler.transform(X).reshape(1, SEQ_LEN, len(feature_cols))
-
-    prob             = float(model.predict(X_scaled)[0][0])
-    model_prediction = prob >= 0.5
-    rand_prediction  = np.random.choice([True, False])
-
-    actual = (
-        df["Adj Close"].iloc[-1] > df["Adj Close"].iloc[-(HORIZON + 1)]
-    )
-
-    print(f"Random Guess : {'UP' if rand_prediction else 'DOWN'}")
-    print(f"Model Guess  : {'UP' if model_prediction else 'DOWN'}")
-    print(f"Actual       : {'UP' if actual else 'DOWN'}")
-    print(f"Random Correct: {rand_prediction == actual}")
-    print(f"Model  Correct: {model_prediction == actual}")
-
-    return {
-        "random_correct" : bool(rand_prediction == actual),
-        "model_correct"  : bool(model_prediction == actual)
-    }
-
-
-# =============================================================================
-# LOGISTIC REGRESSION — FULL EVALUATION
-# =============================================================================
-
-def logistic_regression_evaluation(
-    ticker: str,
-    model_path: str,
-    scaler_path: str
-) -> dict:
-    """
-    Trains a logistic regression on recent data and compares against
-    the LSTM and random guessing on the same test split.
-    Uses the same scaler and GAP logic as the LSTM training.
-    """
-    print("\nEvaluating Logistic Regression vs LSTM vs Random")
-
-    scaler = joblib.load(scaler_path)
-
-    raw = download_data(ticker, years=2)
-    df  = add_technical_indicators(raw)
-
-    feature_cols = [
-        "return_1", "return_5",
-        "SMA_10",   "SMA_21",
-        "EMA_20",   "RSI_14",
-        "BB_width", "vol_pct_change", "Volume"
-    ]
-
-    df_recent = df.iloc[-(SEQ_LEN + HORIZON):]
-    X = df_recent[feature_cols].values
-    y = create_labels(df_recent, HORIZON).values
-
-    X = X[:len(y)]
-    X = scaler.transform(X)
-
-    # Split
-    split = int(len(X) * (1 - TEST_SIZE))
-    train_end = max(split - GAP, 0)
-
-    X_train, y_train = X[:train_end], y[:train_end]
-    X_test,  y_test  = X[split:],     y[split:]
-
-    # Logistic Regression
-    log_reg = LogisticRegression(random_state=SEED, max_iter=1000)
-    log_reg.fit(X_train, y_train)
-    log_preds = log_reg.predict(X_test)
-    log_acc   = accuracy_score(y_test, log_preds)
-
-    print("\nLogistic Regression Results:")
-    print("Accuracy:", log_acc)
-    print(classification_report(y_test, log_preds))
-    print(confusion_matrix(y_test, log_preds))
-
-    # LSTM on same test set
-    lstm_acc   = None
-    rand_acc   = None
-
-    # Reshape for LSTM
-    num_features = len(feature_cols)
-    X_test_3d = X_test.reshape(-1, 1, num_features)  # single-step sequences
-
-    if X_test_3d.size > 0:
-        model = models.load_model(model_path)
-        lstm_preds = (
-            model.predict(
-                X_test.reshape(-1, 1, num_features)
-            ) > 0.5
-        ).astype(int).flatten()
-
-        if len(lstm_preds) == len(y_test):
-            lstm_acc = accuracy_score(y_test, lstm_preds)
-            print("\nLSTM Model Results:")
-            print("Accuracy:", lstm_acc)
-
-        rand_preds = np.random.choice([0, 1], size=len(y_test))
-        rand_acc   = accuracy_score(y_test, rand_preds)
-        print("\nRandom Guessing Results:")
-        print("Accuracy:", rand_acc)
-
-    return {
-        "logistic_regression_accuracy" : log_acc,
-        "lstm_accuracy"                : lstm_acc,
-        "random_accuracy"              : rand_acc
-    }
-
-
-# =============================================================================
-# SINGLE-POINT LOGISTIC REGRESSION PREDICTION
-# =============================================================================
-
-def evaluate_logistic_regression_single(
-    ticker: str,
-    model_path: str,
-    scaler_path: str
-):
-    """
-    Trains logistic regression on all-but-the-last data point,
-    then predicts that last point and checks against actual.
-    """
-    print("\nEvaluating Logistic Regression (single prediction)")
-
-    scaler = joblib.load(scaler_path)
-
-    raw = download_data(ticker, years=2)
-    df  = add_technical_indicators(raw)
-
-    feature_cols = [
-        "return_1", "return_5",
-        "SMA_10",   "SMA_21",
-        "EMA_20",   "RSI_14",
-        "BB_width", "vol_pct_change", "Volume"
-    ]
-
-    df_recent = df.iloc[-(SEQ_LEN + HORIZON):]
-    X = df_recent[feature_cols].values
-    y = create_labels(df_recent, HORIZON).values
-
-    X = X[:len(y)]
-    X = scaler.transform(X)
-
-    X_single  = X[-1].reshape(1, -1)
-    y_single  = y[-1]
-
-    log_reg = LogisticRegression(random_state=SEED, max_iter=1000)
-    log_reg.fit(X[:-1], y[:-1])
-    log_pred = log_reg.predict(X_single)[0]
-
-    print(f"Prediction : {'UP' if log_pred == 1 else 'DOWN'}")
-    print(f"Actual     : {'UP' if y_single == 1 else 'DOWN'}")
-    print(f"Result     : {'CORRECT' if log_pred == y_single else 'WRONG'}")
-
-
-# =============================================================================
-# MAIN MENU
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    choice = input(
-        "Enter 1 to train model, 2 to predict and evaluate: "
-    ).strip()
-
-    if choice == "1":
-        print("Training...")
-        ticker, model_path, scaler_path = train_with_random_data()
-
-    elif choice == "2":
-        ticker = input(
-            f"Ticker ({', '.join(TICKERS)}): "
-        ).upper().strip()
-
-        model_path  = os.path.join(MODEL_DIR, f"{ticker}_best.h5")
-        scaler_path = os.path.join(MODEL_DIR, f"{ticker}_scaler.joblib")
-
-        if not os.path.exists(model_path):
-            print("Model not found. Train first (option 1).")
-        else:
-            check_prediction(ticker, model_path, scaler_path)
-            random_guess_evaluation(ticker, model_path, scaler_path)
-            evaluate_logistic_regression_single(
-                ticker, model_path, scaler_path
-            )
-    else:
-        print("Invalid choice. Enter 1 or 2.")
+    app = StockPredictorApp()
+    app.mainloop()
